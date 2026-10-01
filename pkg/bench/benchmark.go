@@ -25,6 +25,7 @@ import (
 	"math/rand"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -215,44 +216,20 @@ func (c *Common) createEmptyBucket(ctx context.Context) error {
 
 // deleteAllInBucket will delete all content in a bucket.
 // If no prefixes are specified everything in bucket is deleted.
+// Listing is done by a single goroutine, while Concurrency workers each run
+// their own RemoveObjects (1000 keys per request) off the shared channel.
 func (c *Common) deleteAllInBucket(ctx context.Context, prefixes ...string) {
 	if len(prefixes) == 0 {
 		prefixes = []string{""}
 	}
 
-	doneCh := make(chan struct{})
-	defer close(doneCh)
+	// Cancelled when we return, or when every delete worker has stopped, so
+	// the lister can never block forever on a channel nobody reads.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	cl, done := c.Client()
 	defer done()
-
-	objectsCh := make(chan minio.ObjectInfo)
-	go func() {
-		defer close(objectsCh)
-		opts := minio.ListObjectsOptions{
-			Recursive:    true,
-			WithVersions: c.Versioned,
-		}
-		for _, prefix := range prefixes {
-			opts.Prefix = prefix
-			if prefix != "" {
-				opts.Prefix = prefix + "/"
-			}
-			removed := 0
-			c.UpdateStatus(fmt.Sprintf("Clearing Prefix %q", strings.Join([]string{c.Bucket, opts.Prefix}, "/")))
-			for object := range cl.ListObjects(ctx, c.Bucket, opts) {
-				if object.Err != nil {
-					c.Error(object.Err)
-					return
-				}
-				removed++
-				objectsCh <- object
-				if removed%1000 == 0 {
-					c.UpdateStatus(fmt.Sprintf("Clearing Prefix %q. Deleted %d objects", strings.Join([]string{c.Bucket, opts.Prefix}, "/"), removed))
-				}
-			}
-		}
-	}()
 
 	delOpts := minio.RemoveObjectsOptions{}
 	_, _, _, errLock := cl.GetBucketObjectLockConfig(ctx, c.Bucket)
@@ -260,13 +237,61 @@ func (c *Common) deleteAllInBucket(ctx context.Context, prefixes ...string) {
 		delOpts.GovernanceBypass = true
 	}
 
-	errCh := cl.RemoveObjects(ctx, c.Bucket, objectsCh, delOpts)
-	for err := range errCh {
-		if err.Err != nil {
-			c.Error(err.Err)
-			continue
+	workers := max(c.Concurrency, 1)
+	objectsCh := make(chan minio.ObjectInfo, 1000*workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wcl, wdone := c.Client()
+			defer wdone()
+			for err := range wcl.RemoveObjects(ctx, c.Bucket, objectsCh, delOpts) {
+				if err.Err != nil {
+					c.Error(err.Err)
+				}
+			}
+		}()
+	}
+	workersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(workersDone)
+		cancel()
+	}()
+
+	opts := minio.ListObjectsOptions{
+		Recursive:    true,
+		WithVersions: c.Versioned,
+	}
+listing:
+	for _, prefix := range prefixes {
+		opts.Prefix = prefix
+		if prefix != "" {
+			opts.Prefix = prefix + "/"
+		}
+		removed := 0
+		c.UpdateStatus(fmt.Sprintf("Clearing Prefix %q", strings.Join([]string{c.Bucket, opts.Prefix}, "/")))
+		for object := range cl.ListObjects(ctx, c.Bucket, opts) {
+			if object.Err != nil {
+				if ctx.Err() == nil {
+					c.Error(object.Err)
+				}
+				break listing
+			}
+			select {
+			case objectsCh <- object:
+			case <-ctx.Done():
+				break listing
+			}
+			removed++
+			if removed%1000 == 0 {
+				c.UpdateStatus(fmt.Sprintf("Clearing Prefix %q. Deleted %d objects", strings.Join([]string{c.Bucket, opts.Prefix}, "/"), removed))
+			}
 		}
 	}
+	close(objectsCh)
+	<-workersDone
 	c.UpdateStatus("Cleanup Done")
 }
 
