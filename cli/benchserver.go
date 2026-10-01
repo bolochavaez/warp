@@ -107,10 +107,16 @@ func runServerBenchmark(ctx *cli.Context, b bench.Benchmark) (bool, error) {
 		return true, errors.New("use of -autoterm cannot be used with --full on remote benchmarks")
 	}
 
-	var ui ui
-	if !globalQuiet && !globalJSON {
+	uiActive := !globalQuiet && !globalJSON
+	ui := newUI(uiActive)
+	if uiActive {
+		registerUI(ui)
 		go ui.Run()
 	}
+	// Ensure the UI is always torn down and the terminal restored on every
+	// return path (including error returns), then unregister it.
+	defer registerUI(nil)
+	defer ui.Wait()
 
 	conns := newConnections(parseHosts(ctx.String("warp-client"), false))
 	if len(conns.hosts) == 0 {

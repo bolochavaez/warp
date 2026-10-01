@@ -129,11 +129,13 @@ func runBench(ctx *cli.Context, b bench.Benchmark) error {
 			close(out)
 		}
 		fatalIf(probe.NewError(err), "Error running remote benchmark")
+		registerUI(nil)
 		return nil
 	}
-	var ui ui
-	if !globalQuiet && !globalJSON {
-		registerUI(&ui)
+	uiActive := !globalQuiet && !globalJSON
+	ui := newUI(uiActive)
+	if uiActive {
+		registerUI(ui)
 		go ui.Run()
 	}
 

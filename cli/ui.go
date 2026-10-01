@@ -48,7 +48,20 @@ type ui struct {
 	showProgress bool
 	cancelFn     atomic.Pointer[context.CancelFunc]
 	uiCancel     atomic.Pointer[context.CancelFunc]
+	prog         atomic.Pointer[tea.Program]
 	quitCh       chan struct{}
+}
+
+// newUI creates a ui instance. When active is true the ui will take over the
+// terminal in Run(); when false Run() is never started and all methods behave
+// as no-ops so callers can invoke them unconditionally. quitCh is created here
+// (before any Run goroutine is launched) so Wait() never races against Init().
+func newUI(active bool) *ui {
+	u := &ui{}
+	if active {
+		u.quitCh = make(chan struct{})
+	}
+	return u
 }
 
 type tickMsg time.Time
@@ -61,18 +74,29 @@ func tickCmd() tea.Cmd {
 
 func (u *ui) Init() tea.Cmd {
 	u.progress = progress.New(progress.WithSolidFill("#c72e49"), progress.WithWidth(maxWidth-padding))
-	u.quitCh = make(chan struct{})
 	return tea.Batch(tickCmd())
 }
 
 func (u *ui) Run() {
+	// A shutdown may already have been requested (e.g. a fatal error fired)
+	// before this goroutine got scheduled. If so, never touch the terminal.
+	if u.quitPls.Load() {
+		u.finish()
+		return
+	}
 	runtime.LockOSThread()
 	ctx, cancel := context.WithCancel(context.Background())
 	p := tea.NewProgram(u, tea.WithContext(ctx), tea.WithFPS(4))
+	u.prog.Store(p)
 	u.uiCancel.Store(&cancel)
 	defer cancel()
+	// If a shutdown was requested while we were setting up, cancel now so the
+	// event loop exits immediately and p.Run restores the terminal state.
+	if u.quitPls.Load() {
+		cancel()
+	}
 	p.Run() // ignore the error on purpose
-	close(u.quitCh)
+	u.finish()
 	if c := u.cancelFn.Load(); c != nil {
 		cancel := *c
 		cancel()
@@ -80,7 +104,31 @@ func (u *ui) Run() {
 	u.quitPls.Store(true)
 }
 
+// finish closes quitCh exactly once, unblocking any Wait() callers. It is safe
+// to call whether or not the bubbletea program ever started.
+func (u *ui) finish() {
+	if u.quitCh == nil {
+		return
+	}
+	select {
+	case <-u.quitCh:
+		// Already closed.
+	default:
+		close(u.quitCh)
+	}
+}
+
+// Wait requests the ui to shut down and blocks until the bubbletea program has
+// fully torn down and restored the terminal. It is safe to call repeatedly and
+// from any goroutine, including before Run() has started. When the ui is
+// inactive (quiet/JSON mode) it returns immediately.
 func (u *ui) Wait() {
+	// Signal a shutdown durably so Run() honors it even if it hasn't started
+	// the bubbletea program yet.
+	u.quitPls.Store(true)
+	if p := u.prog.Load(); p != nil {
+		p.Kill()
+	}
 	if c := u.uiCancel.Load(); c != nil {
 		cancel := *c
 		cancel()
